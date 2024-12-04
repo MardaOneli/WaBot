@@ -1,305 +1,240 @@
-import { Boom } from '@hapi/boom'
-import NodeCache from 'node-cache'
-import readline from 'readline'
-import makeWASocket, { AnyMessageContent, BinaryInfo, delay, DisconnectReason, downloadAndProcessHistorySyncNotification, encodeWAM, fetchLatestBaileysVersion, getAggregateVotesInPollMessage, getHistoryMsg, isJidNewsletter, makeCacheableSignalKeyStore, makeInMemoryStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '@whiskeysockets/baileys'
-//import MAIN_LOGGER from '../src/Utils/logger'
-import open from 'open'
-import fs from 'fs'
-import P from 'pino'
+import { Boom } from '@hapi/boom'; // Import library untuk menangani error
+import NodeCache from 'node-cache'; // Import library untuk caching
+import readline from 'readline'; // Import library untuk input dari pengguna
+import makeWASocket, {
+	AnyMessageContent,
+	BinaryInfo,
+	delay,
+	DisconnectReason,
+	downloadAndProcessHistorySyncNotification,
+	encodeWAM,
+	fetchLatestBaileysVersion,
+	getAggregateVotesInPollMessage,
+	getHistoryMsg,
+	isJidNewsletter,
+	makeCacheableSignalKeyStore,
+	makeInMemoryStore,
+	proto,
+	useMultiFileAuthState,
+	WAMessageContent,
+	WAMessageKey
+} from '@whiskeysockets/baileys'; // Import library untuk WhatsApp Web API
+import open from 'open'; // Import library untuk membuka URL di browser
+import fs from 'fs'; // Import library untuk sistem file
+import P from 'pino'; // Import library untuk logging
 
-const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` }, P.destination('./wa-logs.txt'))
-logger.level = 'trace'
+// Setup logger untuk mencatat aktivitas
+const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` }, P.destination('./wa-logs.txt'));
+logger.level = 'trace'; // Set level logging ke 'trace'
 
-const useStore = !process.argv.includes('--no-store')
-const doReplies = process.argv.includes('--do-reply')
-const usePairingCode = process.argv.includes('--use-pairing-code')
+// Konfigurasi flags untuk pengaturan
+const useStore = !process.argv.includes('--no-store'); // Menggunakan store jika tidak ada argumen --no-store
+const doReplies = process.argv.includes('--do-reply'); // Mengaktifkan balasan otomatis jika ada argumen --do-reply
+const usePairingCode = process.argv.includes('--use-pairing-code'); // Menggunakan kode pairing jika ada argumen --use-pairing-code
 
-// external map to store retry counts of messages when decryption/encryption fails
-// keep this out of the socket itself, so as to prevent a message decryption/encryption loop across socket restarts
-const msgRetryCounterCache = new NodeCache()
+// Cache untuk menghitung ulang pesan yang gagal
+const msgRetryCounterCache = new NodeCache(); // Membuat cache baru untuk menghitung pesan yang gagal
+const onDemandMap = new Map<string, string>(); // Map untuk menyimpan permintaan sinkronisasi
 
-const onDemandMap = new Map<string, string>()
+// Antarmuka readline untuk input pengguna
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const question = (text: string) => new Promise<string>((resolve) => rl.question(text, resolve)); // Fungsi untuk menanyakan input dari pengguna
 
-// Read line interface
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-const question = (text: string) => new Promise<string>((resolve) => rl.question(text, resolve))
+// Setup store untuk menyimpan data koneksi WA
+const store = useStore ? makeInMemoryStore({ logger }) : undefined; // Membuat store di memori jika diizinkan
+store?.readFromFile('./baileys_store_multi.json'); // Membaca data store dari file
 
-// the store maintains the data of the WA connection in memory
-// can be written out to a file & read from it
-const store = useStore ? makeInMemoryStore({ logger }) : undefined
-store?.readFromFile('./baileys_store_multi.json')
-// save every 10s
+// Simpan store setiap 10 detik
 setInterval(() => {
-	store?.writeToFile('./baileys_store_multi.json')
-}, 10_000)
+	store?.writeToFile('./baileys_store_multi.json'); // Menyimpan data store ke file
+}, 10_000);
 
-// start a connection
-const startSock = async() => {
-	const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
-	// fetch latest version of WA Web
-	const { version, isLatest } = await fetchLatestBaileysVersion()
-	console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`)
+// Fungsi untuk memulai koneksi
+const startSock = async () => {
+	const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info'); // Menggunakan state otentikasi
+	const { version, isLatest } = await fetchLatestBaileysVersion(); // Mengambil versi terbaru dari WA Web
+	console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`); // Menampilkan versi yang digunakan
 
+	// Membuat socket untuk koneksi WA
 	const sock = makeWASocket({
 		version,
 		logger,
-		printQRInTerminal: !usePairingCode,
+		printQRInTerminal: !usePairingCode, // Menampilkan QR di terminal jika tidak menggunakan kode pairing
 		auth: {
-			creds: state.creds,
-			/** caching makes the store faster to send/recv messages */
-			keys: makeCacheableSignalKeyStore(state.keys, logger),
+			creds: state.creds, // Kredensial otentikasi
+			keys: makeCacheableSignalKeyStore(state.keys, logger), // Kunci untuk meng-cache sinyal
 		},
-		msgRetryCounterCache,
-		generateHighQualityLinkPreview: true,
-		// ignore all broadcast messages -- to receive the same
-		// comment the line below out
-		// shouldIgnoreJid: jid => isJidBroadcast(jid),
-		// implement to handle retries & poll updates
-		getMessage,
-	})
+		msgRetryCounterCache, // Cache untuk menghitung pesan yang gagal
+		generateHighQualityLinkPreview: true, // Menghasilkan pratinjau tautan berkualitas tinggi
+		getMessage, // Fungsi untuk mendapatkan pesan
+	});
 
-	store?.bind(sock.ev)
+	store?.bind(sock.ev); // Mengikat store ke event socket
 
-	// Pairing code for Web clients
+	// Kode pairing untuk klien Web
 	if (usePairingCode && !sock.authState.creds.registered) {
-		// todo move to QR event
-		const phoneNumber = await question('Please enter your phone number:\n')
-		const code = await sock.requestPairingCode(phoneNumber)
-		console.log(`Pairing code: ${code}`)
+		const phoneNumber = await question('Please enter your phone number:\n'); // Meminta nomor telepon
+		const code = await sock.requestPairingCode(phoneNumber); // Meminta kode pairing
+		console.log(`Pairing code: ${code}`); // Menampilkan kode pairing
 	}
 
-	const sendMessageWTyping = async(msg: AnyMessageContent, jid: string) => {
-		await sock.presenceSubscribe(jid)
-		await delay(500)
+	// Fungsi untuk mengirim pesan dengan status mengetik
+	const sendMessageWTyping = async (msg: AnyMessageContent, jid: string) => {
+		await sock.presenceSubscribe(jid); // Berlangganan ke status kehadiran pengguna
+		await delay(500); // Menunggu 500ms
+		await sock.sendPresenceUpdate('composing', jid); // Mengirim pembaruan kehadiran 'sedang mengetik'
+		await delay(2000); // Menunggu 2 detik
+		await sock.sendPresenceUpdate('paused', jid); // Mengirim pembaruan kehadiran 'terhenti'
+		await sock.sendMessage(jid, msg); // Mengirim pesan
+	};
 
-		await sock.sendPresenceUpdate('composing', jid)
-		await delay(2000)
+	// Memproses event yang terjadi
+	sock.ev.process(async (events) => {
+		// Menangani pembaruan koneksi
+		if (events['connection.update']) {
+			const update = events['connection.update'];
+			const { connection, lastDisconnect } = update;
 
-		await sock.sendPresenceUpdate('paused', jid)
+			if (connection === 'close') {
+				// Menghubungkan kembali jika tidak keluar
+				if ((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
+					startSock(); // Memulai kembali koneksi
+				} else {
+					console.log('Connection closed. You are logged out.'); // Menampilkan pesan jika keluar
+				}
+			}
+			console.log('connection update', update); // Menampilkan pembaruan koneksi
+		}
 
-		await sock.sendMessage(jid, msg)
-	}
+		// Menyimpan kredensial jika diperbarui
+		if (events['creds.update']) {
+			await saveCreds(); // Menyimpan kredensial
+		}
 
-	// the process function lets you process all events that just occurred
-	// efficiently in a batch
-	sock.ev.process(
-		// events is a map for event name => event data
-		async(events) => {
-			// something about the connection changed
-			// maybe it closed, or we received all offline message or connection opened
-			if(events['connection.update']) {
-				const update = events['connection.update']
-				const { connection, lastDisconnect } = update
-				if(connection === 'close') {
-					// reconnect if not logged out
-					if((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
-						startSock()
-					} else {
-						console.log('Connection closed. You are logged out.')
+		// Menangani berbagai event
+		if (events['labels.association']) {
+			console.log(events['labels.association']); // Menampilkan asosiasi label
+		}
+
+		if (events['labels.edit']) {
+			console.log(events['labels.edit']); // Menampilkan edit label
+		}
+
+		if (events.call) {
+			console.log('recv call event', events.call); // Menampilkan event panggilan yang diterima
+		}
+
+		// Menangani riwayat pesan
+		if (events['messaging-history.set']) {
+			const { chats, contacts, messages, isLatest, progress, syncType } = events['messaging-history.set'];
+			if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
+				console.log('received on-demand history sync, messages=', messages); // Menampilkan sinkronisasi riwayat yang diminta
+			}
+			console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`); // Menampilkan jumlah chat, kontak, dan pesan
+		}
+
+		// Menangani pesan baru
+		if (events['messages.upsert']) {
+			const upsert = events['messages.upsert'];
+			const m = upsert.messages[0];
+            const mText = m.message.conversation;
+			console.log('recv messages ', JSON.stringify(upsert, undefined, 2)); // Menampilkan pesan yang diterima
+
+			// if (upsert.type === 'notify') {
+			//     for (const msg of upsert.messages) {
+			//         if (msg.message?.conversation || msg.message?.extendedTextMessage?.text) {
+			//             const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text; // Mengambil teks pesan
+			//             if (text === "requestPlaceholder" && !upsert.requestId) {
+			//                 const messageId = await sock.requestPlaceholderResend(msg.key); // Meminta pengiriman ulang pesan
+			//                 console.log('requested placeholder resync, id=', messageId); // Menampilkan ID pengiriman ulang
+			//             } else if (upsert.requestId) {
+			//                 console.log('Message received from phone, id=', upsert.requestId, msg); // Menampilkan pesan yang diterima dari telepon
+			//             }
+
+			//             // Menangani permintaan sinkronisasi riwayat
+			//             if (text === "onDemandHistSync") {
+			//                 const messageId = await sock.fetchMessageHistory(50, msg.key, msg.messageTimestamp!); // Mengambil riwayat pesan
+			//                 console.log('requested on-demand sync, id=', messageId); // Menampilkan ID sinkronisasi
+			//             }
+			//         }
+
+			//     }
+			// }
+			// Mengirim balasan jika pesan dari pengirim
+            if (mText === "!test" && m.key.fromMe) {
+                // await sock.readMessages([m.key]); // Menandai pesan sebagai dibaca
+                console.log('replying to', m.key.remoteJid); // Menampilkan ID penerima
+                await sendMessageWTyping({ text: 'WhatsApp Bot is Online!' }, m.key.remoteJid); // Mengirim balasan
+            }
+
+            /* Fitur!!!! */
+			
+		}
+
+		// Menangani pembaruan pesan
+		if (events['messages.update']) {
+			console.log(JSON.stringify(events['messages.update'], undefined, 2)); // Menampilkan pembaruan pesan
+			for (const { key, update } of events['messages.update']) {
+				if (update.pollUpdates) {
+					const pollCreation = await getMessage(key); // Mengambil pesan terkait polling
+					if (pollCreation) {
+						console.log('got poll update, aggregation: ', getAggregateVotesInPollMessage({
+							message: pollCreation,
+							pollUpdates: update.pollUpdates,
+						})); // Menampilkan agregasi suara dari polling
 					}
 				}
-				
-				// WARNING: THIS WILL SEND A WAM EXAMPLE AND THIS IS A ****CAPTURED MESSAGE.****
-				// DO NOT ACTUALLY ENABLE THIS UNLESS YOU MODIFIED THE FILE.JSON!!!!!
-				// THE ANALYTICS IN THE FILE ARE OLD. DO NOT USE THEM.
-				// YOUR APP SHOULD HAVE GLOBALS AND ANALYTICS ACCURATE TO TIME, DATE AND THE SESSION
-				// THIS FILE.JSON APPROACH IS JUST AN APPROACH I USED, BE FREE TO DO THIS IN ANOTHER WAY.
-				// THE FIRST EVENT CONTAINS THE CONSTANT GLOBALS, EXCEPT THE seqenceNumber(in the event) and commitTime
-				// THIS INCLUDES STUFF LIKE ocVersion WHICH IS CRUCIAL FOR THE PREVENTION OF THE WARNING
-				const sendWAMExample = false;
-				if(connection === 'open' && sendWAMExample) {
-					/// sending WAM EXAMPLE
-					const {
-						header: {
-							wamVersion,
-							eventSequenceNumber,
-						},
-						events,
-					} = JSON.parse(await fs.promises.readFile("./boot_analytics_test.json", "utf-8"))
-
-					const binaryInfo = new BinaryInfo({
-						protocolVersion: wamVersion,
-						sequence: eventSequenceNumber,
-						events: events
-					})
-
-					const buffer = encodeWAM(binaryInfo);
-					
-					const result = await sock.sendWAMBuffer(buffer)
-					console.log(result)
-				}
-
-				console.log('connection update', update)
-			}
-
-			// credentials updated -- save them
-			if(events['creds.update']) {
-				await saveCreds()
-			}
-
-			if(events['labels.association']) {
-				console.log(events['labels.association'])
-			}
-
-
-			if(events['labels.edit']) {
-				console.log(events['labels.edit'])
-			}
-
-			if(events.call) {
-				console.log('recv call event', events.call)
-			}
-
-			// history received
-			if(events['messaging-history.set']) {
-				const { chats, contacts, messages, isLatest, progress, syncType } = events['messaging-history.set']
-				if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-					console.log('received on-demand history sync, messages=', messages)
-				}
-				console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`)
-			}
-
-			// received a new message
-			if(events['messages.upsert']) {
-				const upsert = events['messages.upsert']
-				console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
-
-				if(upsert.type === 'notify') {
-					for (const msg of upsert.messages) {
-						//TODO: More built-in implementation of this
-						/* if (
-							msg.message?.protocolMessage?.type ===
-							proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION
-						  ) {
-							const historySyncNotification = getHistoryMsg(msg.message)
-							if (
-							  historySyncNotification?.syncType ==
-							  proto.HistorySync.HistorySyncType.ON_DEMAND
-							) {
-							  const { messages } =
-								await downloadAndProcessHistorySyncNotification(
-								  historySyncNotification,
-								  {}
-								)
-
-								
-								const chatId = onDemandMap.get(
-									historySyncNotification!.peerDataRequestSessionId!
-								)
-								
-								console.log(messages)
-
-							  onDemandMap.delete(
-								historySyncNotification!.peerDataRequestSessionId!
-							  )
-
-							  /*
-								// 50 messages is the limit imposed by whatsapp
-								//TODO: Add ratelimit of 7200 seconds
-								//TODO: Max retries 10
-								const messageId = await sock.fetchMessageHistory(
-									50,
-									oldestMessageKey,
-									oldestMessageTimestamp
-								)
-								onDemandMap.set(messageId, chatId)
-							}
-						  } */
-
-						if (msg.message?.conversation || msg.message?.extendedTextMessage?.text) {
-							const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text
-							if (text == "requestPlaceholder" && !upsert.requestId) {
-								const messageId = await sock.requestPlaceholderResend(msg.key) 
-								console.log('requested placeholder resync, id=', messageId)
-							} else if (upsert.requestId) {
-								console.log('Message received from phone, id=', upsert.requestId, msg)
-							}
-
-							// go to an old chat and send this
-							if (text == "onDemandHistSync") {
-								const messageId = await sock.fetchMessageHistory(50, msg.key, msg.messageTimestamp!) 
-								console.log('requested on-demand sync, id=', messageId)
-							}
-						}
-
-						if(!msg.key.fromMe && doReplies && !isJidNewsletter(msg.key?.remoteJid!)) {
-
-							console.log('replying to', msg.key.remoteJid)
-							await sock!.readMessages([msg.key])
-							await sendMessageWTyping({ text: 'Hello there!' }, msg.key.remoteJid!)
-						}
-					}
-				}
-			}
-
-			// messages updated like status delivered, message deleted etc.
-			if(events['messages.update']) {
-				console.log(
-					JSON.stringify(events['messages.update'], undefined, 2)
-				)
-
-				for(const { key, update } of events['messages.update']) {
-					if(update.pollUpdates) {
-						const pollCreation = await getMessage(key)
-						if(pollCreation) {
-							console.log(
-								'got poll update, aggregation: ',
-								getAggregateVotesInPollMessage({
-									message: pollCreation,
-									pollUpdates: update.pollUpdates,
-								})
-							)
-						}
-					}
-				}
-			}
-
-			if(events['message-receipt.update']) {
-				console.log(events['message-receipt.update'])
-			}
-
-			if(events['messages.reaction']) {
-				console.log(events['messages.reaction'])
-			}
-
-			if(events['presence.update']) {
-				console.log(events['presence.update'])
-			}
-
-			if(events['chats.update']) {
-				console.log(events['chats.update'])
-			}
-
-			if(events['contacts.update']) {
-				for(const contact of events['contacts.update']) {
-					if(typeof contact.imgUrl !== 'undefined') {
-						const newUrl = contact.imgUrl === null
-							? null
-							: await sock!.profilePictureUrl(contact.id!).catch(() => null)
-						console.log(
-							`contact ${contact.id} has a new profile pic: ${newUrl}`,
-						)
-					}
-				}
-			}
-
-			if(events['chats.delete']) {
-				console.log('chats deleted ', events['chats.delete'])
 			}
 		}
-	)
 
-	return sock
+		// Menangani pembaruan penerimaan pesan
+		if (events['message-receipt.update']) {
+			console.log(events['message-receipt.update']); // Menampilkan pembaruan penerimaan pesan
+		}
 
+		// Menangani reaksi pesan
+		if (events['messages.reaction']) {
+			console.log(events['messages.reaction']); // Menampilkan reaksi pesan
+		}
+
+		// Menangani pembaruan kehadiran
+		if (events['presence.update']) {
+			console.log(events['presence.update']); // Menampilkan pembaruan kehadiran
+		}
+
+		// Menangani pembaruan chat
+		if (events['chats.update']) {
+			console.log(events['chats.update']); // Menampilkan pembaruan chat
+		}
+
+		// Menangani pembaruan kontak
+		if (events['contacts.update']) {
+			for (const contact of events['contacts.update']) {
+				if (typeof contact.imgUrl !== 'undefined') {
+					const newUrl = contact.imgUrl === null
+						? null
+						: await sock!.profilePictureUrl(contact.id!).catch(() => null); // Mengambil URL gambar profil baru
+					console.log(`contact ${contact.id} has a new profile pic: ${newUrl}`); // Menampilkan URL gambar profil baru
+				}
+			}
+		}
+
+		// Menangani penghapusan chat
+		if (events['chats.delete']) {
+			console.log('chats deleted ', events['chats.delete']); // Menampilkan chat yang dihapus
+		}
+	});
+
+	return sock; // Mengembalikan socket
+
+	// Fungsi untuk mendapatkan pesan berdasarkan kunci
 	async function getMessage(key: WAMessageKey): Promise<WAMessageContent | undefined> {
-		if(store) {
-			const msg = await store.loadMessage(key.remoteJid!, key.id!)
-			return msg?.message || undefined
+		if (store) {
+			const msg = await store.loadMessage(key.remoteJid!, key.id!); // Memuat pesan dari store
+			return msg?.message || undefined; // Mengembalikan pesan atau undefined
 		}
-
-		// only if store is present
-		return proto.Message.fromObject({})
+		return proto.Message.fromObject({}); // Mengembalikan objek pesan kosong jika store tidak ada
 	}
-}
+};
 
-startSock()
+startSock(); // Memulai koneksi socket
