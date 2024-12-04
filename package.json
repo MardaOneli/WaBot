@@ -1,0 +1,23 @@
+{
+  "name": "wabot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "help": "build and start",
+    "build": "tsc",
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^9.5.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.7.2"
+  }
+}
