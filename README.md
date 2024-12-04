@@ -1,2 +1,2 @@
 # WaBot
-WhatsApp Bot with Piring Code and QR Code
+WhatsApp Bot with Pairing Code and QR Code
